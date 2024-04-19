@@ -8,7 +8,7 @@ import torch
 import src.utils as utils
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-
+from .dset import KPS_KEY
 
 class CocoEvaluator:
     def __init__(self, coco_gt, iou_types):
@@ -21,7 +21,7 @@ class CocoEvaluator:
         for iou_type in iou_types:
             # self.coco_eval[iou_type] = COCOeval(coco_gt, iouType=iou_type)
             coco_eval = COCOeval(coco_gt, iouType=iou_type)     # revision
-            coco_eval.params.kpt_oks_sigmas = np.array([.5, .5, .5, .5]) / 10.0
+            coco_eval.params.kpt_oks_sigmas = np.array([0.5 for _ in range(len(KPS_KEY))]) / 10.0
             self.coco_eval[iou_type] = coco_eval
 
 

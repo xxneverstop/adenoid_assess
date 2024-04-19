@@ -14,26 +14,31 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
-from PIL import Image
+import imgaug.augmenters as iaa
+import imgaug
 
 from util.disk import getCache
 
+DATA_DIR = 'data_100_5kps'
+IMAGE_GLOB_PATTERN = DATA_DIR + "/images/*.jpg"
+KPS_CSV_PATH = DATA_DIR + '/kps_csv_data/kps_data.csv'
+CACHE_ROOT = DATA_DIR + '/cache/'
+CACHE_DIR = 'images_data_cache'
 
+# KPS_KEY = ['O', 'M', 'T', 'HP']
+KPS_KEY = ['Ba', 'Ar', 'T', 'PNS', 'W']
 
-kps_key = ['O', 'M', 'T', 'HP']
-# CandidateInfoTuple(isNodule_bool=False, diameter_mm=0.0, series_uid='1....666426688999739595820', center_xyz=(25.31, -222.1, -158.99))
-KPSInfoTuple = namedtuple('KPSInfoTuple', 'series_uid, kps_01, kps_02, kps_03, kps_04')
 
 @functools.lru_cache(1)
 def get_kps_list(requireOnDisk_bool=True):
     print(get_kps_list.__name__)
-    jpg_list = glob.glob("data_300/images/*.jpg")
+    jpg_list = glob.glob(IMAGE_GLOB_PATTERN)
     presentOnDisk_set = {os.path.split(p)[-1][:-4] for p in jpg_list}
 
     # print(len(presentOnDisk_set))
 
     kps_list = []
-    with open('data_300/kps_csv_data/kps_data.csv', "r") as f:
+    with open(KPS_CSV_PATH, "r") as f:
         for row in list(csv.reader(f))[1:]:
             series_uid = row[0]
             if series_uid not in presentOnDisk_set and requireOnDisk_bool:
@@ -44,7 +49,55 @@ def get_kps_list(requireOnDisk_bool=True):
 
     return kps_list
 
-    
+def get_croped_kps_data(image_path, keypoints):
+    # assert keypoints.dtype == np.float32
+    image_data = cv2.imread(image_path)
+    image_data = cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB)
+    keypoints = keypoints.astype(np.float32)
+    # print("keypoints.shape", keypoints.shape)
+
+    # flat
+    keypoints_flatted = [el[0:2] for kp in keypoints for el in kp]
+    keypoints_flatted = np.array(keypoints_flatted).flatten()
+    # print("keypoints_flatted.shape", keypoints_flatted.shape)
+
+    # draw_points_from_labelme_with_data(image_data, keypoints_flatted.reshape(-1, 2))
+    pairs = [(keypoints_flatted[i], keypoints_flatted[i + 1])
+             for i in range(0, len(keypoints_flatted), 2)]
+    # print(keypoints)
+
+    Keypoint_list = []
+    for pair in pairs:
+        x, y = pair
+        keypoint = imgaug.Keypoint(x=x, y=y)
+        Keypoint_list.append(keypoint)
+
+
+    # image_data = np.transpose(image_data, (2, 0, 1))
+
+    keypoints = imgaug.KeypointsOnImage(Keypoint_list, shape=image_data.shape)
+    seq = iaa.Sequential(
+        [iaa.CropToFixedSize(width=1200, height=1500, position='center')])
+    image_aug, kps_aug = seq(image=image_data, keypoints=keypoints)
+    xy_array = kps_aug.to_xy_array()
+    # print(xy_array)
+    keypoints_aug = np.array([np.insert(xy_array, 2, 1, axis=1).tolist()]).astype(np.float32)
+    # draw_points_from_labelme_with_data(image_aug, xy_array)
+    return keypoints_aug
+
+
+@functools.lru_cache(1, typed=True)
+def get_croped_image_data(image_path):
+    image_data = cv2.imread(image_path)
+    image_data = cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB)
+
+    seq = iaa.Sequential(
+        [iaa.CropToFixedSize(width=1200, height=1500, position='center')])
+    image_aug = seq(image=image_data)
+
+    return image_aug
+
+
 
 @functools.lru_cache(1, typed=True)
 def read_image(image_path):
@@ -53,11 +106,15 @@ def read_image(image_path):
     return image_data
 
 
-raw_cache = getCache('data_300/cache/', 'images_data_cache')
+
+
+
+raw_cache = getCache(CACHE_ROOT, CACHE_DIR)
 @raw_cache.memoize(typed=True)
 def get_image_data(image_path):
     # print(get_image_data.__name__)
-    return read_image(image_path)
+    image = get_croped_image_data(image_path)
+    return image
 
 
 
@@ -65,7 +122,7 @@ def get_image_data(image_path):
 class XRayDataset(Dataset):
 
     def __init__(self,
-                 data_dir='data_300',
+                 data_dir=DATA_DIR,
                  transform=None,
                  demo=False,
                  augmentation_dict=None,
@@ -84,18 +141,21 @@ class XRayDataset(Dataset):
         self.demo = demo
         self.data_dir = data_dir
         self.transform = transform
-        self.image_name_list = sorted(
+        self.image_name_list = sorted(  
             os.listdir(os.path.join(data_dir, "images")))
-        # print('kps_list', self.kps_list)
         self.kps_list = sorted(self.kps_list, key=lambda x: x[0])
-
+       
         series_id_list = [row[0] for row in self.kps_list]
         for filename in self.image_name_list:
             if filename[:-4] not in series_id_list:
+                # print(filename[:-4])
+                self.image_name_list.remove(filename)
+        for filename in self.image_name_list:
+            if filename[:-4] not in series_id_list:
+                # print(filename[:-4])
                 self.image_name_list.remove(filename)
 
         self.image_name_list = sorted(self.image_name_list)
-
         for i in range(len(self.kps_list)):
             if self.image_name_list[i][:-4] != self.kps_list[i][0]:
                 print("data location not match", self.image_name_list[i],
@@ -124,18 +184,7 @@ class XRayDataset(Dataset):
             self.kps_list = self.kps_list[int(0.8 * len(self.kps_list)):]
         else:
             self.image_name_list = self.image_name_list
-        # print(np.array(self.kps_list[0][1:]).reshape(4, 2).astype(np.float32))
 
-        # diameter_dict = {}
-        # with open("data/part2/luna/annotations.csv", "r") as f:
-        #     for row in list(csv.reader(f))[1:]:
-        #         series_uid = row[0]
-        #         annotationCenter_xyz = tuple([float(x) for x in row[1:4]])
-        #         annotationDiameter_mm = float(row[4])
-
-        #         diameter_dict.setdefault(series_uid, []).append(
-        #             (annotationCenter_xyz, annotationDiameter_mm),
-        #         )
 
     def __len__(self):
         return len(self.image_name_list)
@@ -153,30 +202,28 @@ class XRayDataset(Dataset):
         # convert kps
 
         keypoints_original = self._get_kps_from_kps_info(kps_info)
-        bboxes_original = self._get_boxes_from_keypoints(keypoints_original)
-        # print("bboxes_original", bboxes_original)
-        # print("keypoints_original", keypoints_original)
-        # sys.exit()
-        bboxes_labels_original = ['air_way' for _ in bboxes_original]
+
         # sys.exit()
         if self.use_cache:
             image_original = get_image_data(image_path)
+            keypoints_original = get_croped_kps_data(image_path, keypoints_original)
         else:
-            image_original = cv2.imread(image_path)
-            image_original = cv2.cvtColor(image_original, cv2.COLOR_BGR2RGB)
+            image_original = get_croped_image_data(image_path, keypoints_original)
+            keypoints_original = get_croped_kps_data(image_path, keypoints_original)
+        # print("keypoints_original:", keypoints_original)
 
+        # print("----------------image_original:", image_original)
+
+
+        bboxes_original = self._get_boxes_from_keypoints(keypoints_original)
+
+        bboxes_labels_original = ['air_way' for _ in bboxes_original]
 
         if self.transform:
-            # Converting keypoints from [x,y,visibility]-format to [x, y]-format + Flattening nested list of keypoints
-            # For example, if we have the following list of keypoints for three objects (each object has two keypoints):
-            # [[obj1_kp1, obj1_kp2], [obj2_kp1, obj2_kp2], [obj3_kp1, obj3_kp2]], where each keypoint is in [x, y]-format
-            # Then we need to convert it to the following list:
-            # [obj1_kp1, obj1_kp2, obj2_kp1, obj2_kp2, obj3_kp1, obj3_kp2]
             keypoints_original_flattened = [
                 el[0:2] for kp in keypoints_original for el in kp
             ]
-            # print("keypoints_original_flattened", keypoints_original_flattened)
-            # Apply augmentations
+
             transformed = self.transform(
                 image=image_original,
                 bboxes=bboxes_original,
@@ -195,12 +242,6 @@ class XRayDataset(Dataset):
 
         else:
             image, bboxes, keypoints = image_original, bboxes_original, keypoints_original
-
-        # print("bboxes_original", bboxes_original)
-        # print("keypoints_original", keypoints_original)
-        # print("bboxes", bboxes)
-        # print("keypoints", keypoints)
-        # sys.exit()
 
         # Convert everything into a torch tensor
         bboxes = torch.as_tensor(bboxes, dtype=torch.float32)
@@ -230,10 +271,8 @@ class XRayDataset(Dataset):
                                                  dtype=torch.int64)
         target_original["keypoints"] = torch.as_tensor(keypoints_original,
                                                        dtype=torch.float32)
+        
         image_original = F.to_tensor(image_original)
-
-        # print("target", target)
-        # print("target_original", target_original)
 
         if self.demo:
             return image, target, image_original, target_original
@@ -241,18 +280,16 @@ class XRayDataset(Dataset):
             return image, target
 
     def _get_kps_from_kps_info(self, kps_info):
-        keypoints_original = np.array(kps_info[1:]).reshape(4, 2).astype(
-            np.float32)
+        keypoints_original = np.array(kps_info[1:]).reshape(len(KPS_KEY), 2)
+        try:
+            # Code that might raise an exception
+            keypoints_original = keypoints_original.astype(np.float32)
+        except ValueError:
+            # Code to handle the exception
+            print("ValueError", kps_info)
         # bboxes_original = self._get_boxes_from_keypoints(keypoints_original)
         keypoints_original = np.array(
             [np.insert(keypoints_original, 2, 1, axis=1).tolist()])
-
-        # keypoints_original = keypoints_original.reshape(
-        #     -1, 2, keypoints_original.shape[1])
-        # print("2_keypoints_original", keypoints_original)
-
-        # keypoints_original = np.stack(keypoints_original)
-        # print("3_keypoints_original", keypoints_original)
 
         return keypoints_original
 
@@ -277,70 +314,7 @@ class XRayDataset(Dataset):
         bounding_box = np.array([[min_x, min_y, max_x, max_y]])
 
         return bounding_box
-        # boxes = keypoints[:, :, :2].reshape(-1, 4)
-        # boxes = np.array(boxes, dtype=np.float32)
 
-        # # Adjust coordinates where x2 < x1 or y2 < y1
-        # adjusted_data = boxes.copy()
-        # adjusted_data[:, [0, 2]] = np.sort(adjusted_data[:, [0, 2]], axis=1)
-        # adjusted_data[:, [1, 3]] = np.sort(adjusted_data[:, [1, 3]], axis=1)
-
-        # # Add margin of 10 to each box
-        # margin = 10
-        # for i in range(adjusted_data.shape[0]):  # Iterate over each box
-        #     adjusted_data[i, 0] -= margin  # Subtract 10 from x1
-        #     adjusted_data[i, 1] -= margin  # Subtract 10 from y1
-        #     adjusted_data[i, 2] += margin  # Add 10 to x2
-        #     adjusted_data[i, 3] += margin  # Add 10 to y2
-
-        # margin = 10
-        # # Add margin of 10 to each box
-        # margin = 10
-        # data = boxes.copy()
-        # for i in range(data.shape[0]):  # Iterate over each box
-        #     # Compare x-coordinates
-        #     if data[i, 0] < data[i, 2]:  # If x1 < x2
-        #         data[i, 0] -= margin  # Subtract 10 from x1
-        #         data[i, 2] += margin  # Add 10 to x2
-        #     else:
-        #         data[i, 0] += margin  # Add 10 to x1
-        #         data[i, 2] -= margin  # Subtract 10 from x2
-
-        #     # Compare y-coordinates
-        #     if data[i, 1] < data[i, 3]:  # If y1 < y2
-        #         data[i, 1] -= margin  # Subtract 10 from y1
-        #         data[i, 3] += margin  # Add 10 to y2
-        #     else:
-        #         data[i, 1] += margin  # Add 10 to y1
-        #         data[i, 3] -= margin  # Subtract 10 from y2
-
-        # return adjusted_data
-        min_x = float('inf')
-        max_x = float('-inf')
-        min_y = float('inf')
-        max_y = float('-inf')
-        flat_keypoints = keypoints.flatten()
-        # Iterate through keypoints to find min and max x and y coordinates
-        for i in range(0, len(flat_keypoints), 2):
-            x = flat_keypoints[i]
-            y = flat_keypoints[i + 1]
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
-
-        # Add a margin to the bounding box
-        margin = 10  # Adjust this value to change the margin
-        min_x -= margin
-        min_y -= margin
-        max_x += margin
-        max_y += margin
-
-        # Construct bounding box coordinates
-        bounding_box = [[min_x, min_y, max_x, max_y],
-                        [min_x, min_y, max_x, max_y]]
-
-        return bounding_box
 
     def _find_max_num_coordinates(self):
         max_num_coordinates = 0

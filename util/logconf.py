@@ -1,4 +1,3 @@
-import logging
 import logging.handlers
 
 root_logger = logging.getLogger()

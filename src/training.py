@@ -1,21 +1,12 @@
 import os
 import sys
-import glob
-import csv
-import json
-import random
-import copy
-import functools
-from collections import namedtuple
-from PIL import Image
+
 
 import numpy as np
-import cv2
 import torch
 import torchvision
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import functional as F
 from torchvision.models.detection.rpn import AnchorGenerator
 from torch.utils.tensorboard import SummaryWriter
 
@@ -27,19 +18,17 @@ import warnings
 from .utils import collate_fn
 from .utils import visualize_prediction_comparision
 from .dset import XRayDataset
-from .coco_utils import get_coco, get_coco_kp
 from .engine import train_one_epoch, evaluate
-from .group_by_aspect_ratio import GroupedBatchSampler, create_aspect_ratio_groups
-from util.disk import getCache
 from util.logconf import logging
-
+from .dset import KPS_KEY
 warnings.filterwarnings("ignore")
-
-
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:100"
+
+BATCH_SIZE = 2
 
 class TrainingApp:
     def __init__(self, sys_argv=None):
@@ -49,89 +38,36 @@ class TrainingApp:
 
         parser.add_argument('--batch-size',
             help='Batch size to use for training',
-            default=3,
+            default=BATCH_SIZE,
             type=int,
         )
         parser.add_argument('--num-workers',
             help='Number of worker processes for background data loading',
-            default=8,
+            default=4,
             type=int,
         )
         parser.add_argument('--epochs',
             help='Number of epochs to train for',
-            default=5,
+            default=10,
             type=int,
         )
-        parser.add_argument('--balanced',
-            help="Balance the training data to half positive, half negative.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augmented',
-            help="Augment the training data.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augment-flip',
-            help="Augment the training data by randomly flipping the data left-right, up-down, and front-back.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augment-offset',
-            help="Augment the training data by randomly offsetting the data slightly along the X and Y axes.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augment-scale',
-            help="Augment the training data by randomly increasing or decreasing the size of the candidate.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augment-rotate',
-            help="Augment the training data by randomly rotating the data around the head-foot axis.",
-            action='store_true',
-            default=False,
-        )
-        parser.add_argument('--augment-noise',
-            help="Augment the training data by randomly adding noise to the data.",
-            action='store_true',
-            default=False,
+        parser.add_argument('--num-keypoints',
+            help='Number of keypoints to detect',
+            default=len(KPS_KEY),
+            type=int,
         )
 
-        parser.add_argument('--tb-prefix',
-            default='p2ch12',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
-        )
-        parser.add_argument('comment',
-            help="Comment suffix for Tensorboard run.",
-            nargs='?',
-            default='adenoid_assess',
-        )
 
         self.cli_args = parser.parse_args(sys_argv)
-        self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H.%M.%S')
 
         self.trn_writer = None
         self.val_writer = None
         self.totalTrainingSamples_count = 0
 
-        self.augmentation_dict = {}
-        if self.cli_args.augmented or self.cli_args.augment_flip:
-            self.augmentation_dict['flip'] = True
-        if self.cli_args.augmented or self.cli_args.augment_offset:
-            self.augmentation_dict['offset'] = 0.1
-        if self.cli_args.augmented or self.cli_args.augment_scale:
-            self.augmentation_dict['scale'] = 0.2
-        if self.cli_args.augmented or self.cli_args.augment_rotate:
-            self.augmentation_dict['rotate'] = True
-        if self.cli_args.augmented or self.cli_args.augment_noise:
-            self.augmentation_dict['noise'] = 25.0
 
         self.use_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
-        self.time_str = datetime.datetime.now().strftime("%Y_%m_%d--%H_%M_%S")
-
-
+        self.time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
     def init_model(self, num_keypoints, weights_path=None):
@@ -141,12 +77,6 @@ class TrainingApp:
                                                                     num_keypoints=num_keypoints,
                                                                     num_classes = 2, # Background is the first class, object is the second class
                                                                     rpn_anchor_generator=anchor_generator)
-        # model = torchvision.models.detection.keypointrcnn_resnet101_fpn(pretrained=False,
-        #                                                             pretrained_backbone=True,
-        #                                                             num_keypoints=num_keypoints,
-        #                                                             num_classes = 2, # Background is the first class, object is the second class
-        #                                                             rpn_anchor_generator=anchor_generator)
-
         if weights_path:
             state_dict = torch.load(weights_path)
             model.load_state_dict(state_dict)
@@ -166,18 +96,16 @@ class TrainingApp:
                 A.HorizontalFlip(p=0.5),  # Randomly flip the image horizontally
                 A.VerticalFlip(p=0.5),  # Randomly flip the image vertically
                 A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=50, shift_limit_x=0.2, shift_limit_y=0.2, p=0.5),  # Randomly shift, scale, and rotate the image
-                # A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, brightness_by_max=True, always_apply=False, p=1), # Random change of brightness & contrast
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, brightness_by_max=True, always_apply=False, p=1), # Random change of brightness & contrast
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=255.0, always_apply=False, p=1.0),
             ], p=1)
-
         ],
         keypoint_params=A.KeypointParams(format='xy'), # More about keypoint formats used in albumentations library read at https://albumentations.ai/docs/getting_started/keypoints_augmentation/
         bbox_params=A.BboxParams(format='pascal_voc', label_fields=['bboxes_labels']) # Bboxes should have labels, read more here https://albumentations.ai/docs/getting_started/bounding_boxes_augmentation/
         )
 
-
     def init_train_dl(self):
         train_ds = XRayDataset(
-            augmentation_dict=self.augmentation_dict,
             mode='train',
             transform=self.train_transform()
         )
@@ -237,13 +165,13 @@ class TrainingApp:
 
         return test_dl
 
-    def init_writer(self):
+    def init_writer(self, writer_label):
         log_dir = os.path.join('runs', self.time_str)
 
         self.trn_writer = SummaryWriter(
-            log_dir=log_dir + '-trn_cls-' + self.cli_args.comment)
+            log_dir=log_dir + '-trn_cls-' + writer_label)
         self.val_writer = SummaryWriter(
-            log_dir=log_dir + '-val_cls-' + self.cli_args.comment)
+            log_dir=log_dir + '-val_cls-' + writer_label)
 
 
 
@@ -252,14 +180,26 @@ class TrainingApp:
         train_dl = self.init_train_dl()
         eval_dl = self.init_eval_dl()
 
-        model = self.init_model(num_keypoints=4)
+        model = self.init_model(num_keypoints=self.cli_args.num_keypoints)
 
-        self.init_writer()
+        
+        params = [p for p in model.parameters() if p.requires_grad]
+        writer_label = f'{self.cli_args.batch_size}bth_{self.cli_args.epochs}epochs_'
+
+        # SGD
+        optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.3)
+        writer_label += 'SGD'
+        
+        # Adam
+        # optimizer = torch.optim.Adam(params, lr=0.001, weight_decay=0.0005)
+        # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.3)
+        # writer_label += 'Adam'
+
+        self.init_writer(writer_label)
         trn_writer = self.trn_writer
         val_writer = self.val_writer
-        params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(params, lr=0.001, momentum=0.9, weight_decay=0.0005)
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.3)
+        
         num_epochs = self.cli_args.epochs
 
         for epoch_ndx in range(1, self.cli_args.epochs + 1):
@@ -279,55 +219,27 @@ class TrainingApp:
 
         trn_writer.close()
         # Save model weights after training
-        torch.save(model.state_dict(), str(num_epochs) + "_epochs--" + datetime.datetime.now().strftime("%Y_%m_%d--%H_%M_%S") + "-weights.pth")
-
-
-        # dlwp
-        # for epoch_ndx in range(1, self.cli_args.epochs + 1):
-        #     log.info("Epoch {} of {}, {}/{} batches of size {}*{}".format(
-        #         epoch_ndx,
-        #         self.cli_args.epochs,
-        #         len(train_dl),
-        #         len(val_dl),
-        #         self.cli_args.batch_size,
-        #         (torch.cuda.device_count() if self.use_cuda else 1),
-        #     ))
-
-        #     trnMetrics_t = self.doTraining(epoch_ndx, train_dl)
-        #     self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
-
-        #     valMetrics_t = self.doValidation(epoch_ndx, val_dl)
-        #     self.logMetrics(epoch_ndx, 'val', valMetrics_t)
-
-        # if hasattr(self, 'trn_writer'):
-        #     self.trn_writer.close()
-        #     self.val_writer.close()
-
+        torch.save(model.state_dict(), str(num_epochs) + "_epochs-" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + "-weights.pth")
 
         print('s')
 
 
     def test(self):
         test_dl = self.init_test_dl()
-        model = self.init_model(num_keypoints=4)
-        model.load_state_dict(torch.load('100_epochs--2024_03_12--06_29_47-weights.pth'))
+        model = self.init_model(num_keypoints=self.cli_args.num_keypoints)
+        model.load_state_dict(torch.load('10_epochs--20240419_115217-weights.pth'))
 
+        count = 0
         for images, targets in test_dl:
-        # iterator = iter(test_dl)
-        # images, targets = next(iterator)
-        # print(len(images), len(targets))
             images = list(image.to(self.device) for image in images)
             box_groundtruth = targets[0]["boxes"].numpy().astype(int)
             kps_groundtruth = targets[0]["keypoints"][..., :2].numpy()[0].astype(int)
-            # print("ground truth targets:", targets)
-            # print("box_groundtruth:\n", box_groundtruth)
-            # print("kps_groundtruth:\n", kps_groundtruth)
+            
             with torch.no_grad():
                 model.to(self.device)
                 model.eval()
                 output = model(images)
 
-            # print("Predictions: \n", output)
             image = (images[0].permute(1,2,0).detach().cpu().numpy() * 255).astype(np.uint8)
             scores = output[0]['scores'].detach().cpu().numpy()
 
@@ -345,28 +257,24 @@ class TrainingApp:
             bboxes = []
             for bbox in output[0]['boxes'][high_scores_idxs][post_nms_idxs].detach().cpu().numpy():
                 bboxes.append(list(map(int, bbox.tolist())))
+            if len(keypoints) == 0:
+                continue
             keypoints = keypoints[0]
-            # print("predicted bboxes:\n", np.array(bboxes))
-            # print("predicted keypoints:\n", np.array(keypoints))
-
-
 
             kps_predicted = np.array(keypoints)
             # Swap elements where the denominator is smaller
             swap_mask = kps_groundtruth < kps_predicted
             kps_divided = np.where(swap_mask, kps_groundtruth, kps_predicted) / np.where(swap_mask, kps_predicted, kps_groundtruth)
-            # print("kps_divided", kps_divided)
             # Compute the average of the sum of coordinates
             flat_data = kps_divided.flatten()
             # Compute the average
             average_value = np.mean(flat_data)
             print("Average similarity:", average_value)
-
-
-
-
-            visualize_prediction_comparision(image, np.array(bboxes), np.array(keypoints), box_groundtruth, kps_groundtruth)
-
+            if average_value > 0.95:
+                count += 1
+                visualize_prediction_comparision(image, np.array(bboxes), np.array(keypoints), box_groundtruth, kps_groundtruth)
+            
+        print("avg_simi > 0.99:", count, "all:", len(test_dl))
 
 if __name__ == '__main__':
     TrainingApp().main()
